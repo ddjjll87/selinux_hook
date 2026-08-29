@@ -1810,53 +1810,21 @@ static void snapshot_clean_policy(const char *reason)
     if (READ_ONCE(g_dirty_policy_seen))
         return;
 
-    if (!snapshot_magisk_policy_file(reason, true)) {
-        /*
-         * APatch/folkpatch 没有 /.magisk/selinux/load（那是 Magisk 专用
-         * 干净策略备份）。在 boot 早期（complete_init 前后）live policy
-         * 还是系统初始干净策略，可尝试通过 security_read_policy 主动读取
-         * 作为干净 blob。模块自己的 security_read_policy hook 在 blob
-         * 为空时不拦截，因此这里拿到的是真实 live policy。
-         *
-         * stateful 内核（4.17+）的 security_read_policy(state, ...) 在
-         * 单实例 selinux_state 下忽略 state 参数，传 NULL 是安全的
-         * （KernelPatch 官方 selinux_compat_call_kfunc 在符号缺失时同样
-         * 传 NULL）。因此即使 g_selinux_state 为 NULL 也可尝试。
-         */
-        if (security_read_policy_fn && !READ_ONCE(g_dirty_policy_seen)) {
-            void *data = NULL;
-            size_t len = 0;
-            int rc = -EINVAL;
-
-            if (selinux_compat_call_needed() && security_read_policy_compat_fn)
-                rc = security_read_policy_compat_fn(g_selinux_state, &data, &len);
-            else if (security_read_policy_fn)
-                rc = security_read_policy_fn(&data, &len);
-
-            if (rc == 0 && data && len && len <= MAGISK_POLICY_MAX_SIZE &&
-                !buffer_contains_magisk(data, len)) {
-                void *copy = vmalloc_fn ? vmalloc_fn(len) : NULL;
-
-                if (copy) {
-                    copy_bytes(copy, data, len);
-                    if (vfree_fn)
-                        vfree_fn(data);
-                    WRITE_ONCE(g_clean_policy_has_magisk, false);
-                    WRITE_ONCE(g_clean_policy_len, len);
-                    WRITE_ONCE(g_clean_policy_blob, copy);
-                    pr_info("[selinux_hook] CLEAN policy captured via security_read_policy reason=%s blob=%px len=%zu\n",
-                            reason ?: "(null)", copy, len);
-                    activate_clean_policy_blob(reason ?: "security_read_policy");
-                    return;
-                }
-            } else if (data && len && len <= MAGISK_POLICY_MAX_SIZE) {
-                pr_warn("[selinux_hook] CLEAN security_read_policy snapshot rejected reason=%s len=%zu has_magisk=%d\n",
-                        reason ?: "(null)", len,
-                        buffer_contains_magisk(data, len) ? 1 : 0);
-            }
-        }
+    /*
+     * 只尝试 Magisk 策略文件快照，不主动调用 security_read_policy()。
+     *
+     * 原因：小米 4.19 魔改内核裁剪了 selinux_state 符号，本模块通过
+     * kallsyms_lookup_name 解析不到它（KernelPatch 的 kvar 机制不受
+     * kptr_restrict 影响，但我们这里没有该能力）。此时以 NULL state
+     * 调用 stateful 的 security_read_policy(state, ...) 可能触发 NULL
+     * 解引用 panic，导致启动卡在第一屏。
+     *
+     * 干净策略改由 finish_deferred_policy_capture() 在
+     * security_load_policy() 的 after 阶段捕获参数获得（boot 早期
+     * 第一次加载的就是系统初始干净策略）。
+     */
+    if (!snapshot_magisk_policy_file(reason, true))
         return;
-    }
 
     activate_clean_policy_blob(reason);
 }
@@ -1872,7 +1840,12 @@ static bool finish_deferred_policy_capture(hook_fargs4_t *a, const char *stage,
     if (READ_ONCE(g_dirty_policy_seen))
         return false;
 
-    if (snapshot_magisk_policy_file(stage, true)) {
+    /*
+     * hook 路径（a != NULL）不尝试文件快照：security_load_policy 调用
+     * 时执行 filp_open 有锁序/阻塞风险，且 APatch 上该文件本就不存在。
+     * 文件快照只在非 hook 路径（snapshot_clean_policy）尝试。
+     */
+    if (!a && snapshot_magisk_policy_file(stage, true)) {
         activate_clean_policy_blob(stage);
         return READ_ONCE(g_clean_policy_blob) != NULL;
     }
@@ -1961,12 +1934,12 @@ static void before_security_load_policy(hook_fargs4_t *a, void *u)
         return;
 
     /*
-     * before 阶段参数 buffer 仍完整（内核尚未消费），此时抓取最可靠。
-     * 用 allow_fallback=true：文件不存在时直接抓 security_load_policy
-     * 的参数（boot 早期第一次调用加载的是系统初始干净策略）。
+     * before 阶段只试文件快照，不抓参数：security_load_policy 持有
+     * policy 锁，此时做 filp_open 文件 IO 或 vmalloc 复制可能死锁。
+     * 参数捕获放到 after 阶段（allow_fallback=true），此时锁已释放。
      */
     g_policy_capture_in_progress = true;
-    finish_deferred_policy_capture(a, "before_security_load_policy", true);
+    finish_deferred_policy_capture(a, "before_security_load_policy", false);
     g_policy_capture_in_progress = false;
 }
 
