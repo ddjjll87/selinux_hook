@@ -865,13 +865,27 @@ static bool selinux_compat_call_needed(void)
      * 4.14 sources listed above.  Keep the state argument through the Android
      * common stateful era, and stop before the newer 6.4+ LSM refactors where
      * this KPM has not been audited.
+     *
+     * 注意：不能依赖 g_selinux_state 符号是否可见。小米 4.19 魔改内核
+     * (cepheus/sm8150) 裁剪了 selinux_state 全局符号，但 SELinux 仍是
+     * stateful ABI（security_read_policy/security_load_policy 等仍带
+     * struct selinux_state * 首参）。KernelPatch 官方 selinux_need_call_compat()
+     * 也只看 kver 区间（4.17-6.4）。g_selinux_state 为 NULL 时传 NULL state
+     * （这些内核函数在单实例 selinux_state 下实际使用内部全局，忽略参数）。
      */
-	return g_selinux_state && selinux_state_arg_required();
+	return selinux_state_arg_required();
 }
 
 static bool selinux_state_arg_required(void)
 {
-    return kver >= VERSION(4, 14, 0) && kver < VERSION(6, 4, 0);
+    /*
+     * 对齐 KernelPatch 官方 selinux_need_call_compat()：
+     *   kver >= 4.17 && kver < 6.4
+     * 4.17 起 SELinux 全面 stateful（security_read_policy/security_load_policy
+     * 等带 struct selinux_state * 首参）。此判断只看内核版本，不依赖
+     * selinux_state 符号是否在 kallsyms 可见。
+     */
+    return kver >= VERSION(4, 17, 0) && kver < VERSION(6, 4, 0);
 }
 
 static bool policydb_offset_fallback_allowed(void)
@@ -1796,8 +1810,53 @@ static void snapshot_clean_policy(const char *reason)
     if (READ_ONCE(g_dirty_policy_seen))
         return;
 
-    if (!snapshot_magisk_policy_file(reason, true))
+    if (!snapshot_magisk_policy_file(reason, true)) {
+        /*
+         * APatch/folkpatch 没有 /.magisk/selinux/load（那是 Magisk 专用
+         * 干净策略备份）。在 boot 早期（complete_init 前后）live policy
+         * 还是系统初始干净策略，可尝试通过 security_read_policy 主动读取
+         * 作为干净 blob。模块自己的 security_read_policy hook 在 blob
+         * 为空时不拦截，因此这里拿到的是真实 live policy。
+         *
+         * stateful 内核（4.17+）的 security_read_policy(state, ...) 在
+         * 单实例 selinux_state 下忽略 state 参数，传 NULL 是安全的
+         * （KernelPatch 官方 selinux_compat_call_kfunc 在符号缺失时同样
+         * 传 NULL）。因此即使 g_selinux_state 为 NULL 也可尝试。
+         */
+        if (security_read_policy_fn && !READ_ONCE(g_dirty_policy_seen)) {
+            void *data = NULL;
+            size_t len = 0;
+            int rc = -EINVAL;
+
+            if (selinux_compat_call_needed() && security_read_policy_compat_fn)
+                rc = security_read_policy_compat_fn(g_selinux_state, &data, &len);
+            else if (security_read_policy_fn)
+                rc = security_read_policy_fn(&data, &len);
+
+            if (rc == 0 && data && len && len <= MAGISK_POLICY_MAX_SIZE &&
+                !buffer_contains_magisk(data, len)) {
+                void *copy = vmalloc_fn ? vmalloc_fn(len) : NULL;
+
+                if (copy) {
+                    copy_bytes(copy, data, len);
+                    if (vfree_fn)
+                        vfree_fn(data);
+                    WRITE_ONCE(g_clean_policy_has_magisk, false);
+                    WRITE_ONCE(g_clean_policy_len, len);
+                    WRITE_ONCE(g_clean_policy_blob, copy);
+                    pr_info("[selinux_hook] CLEAN policy captured via security_read_policy reason=%s blob=%px len=%zu\n",
+                            reason ?: "(null)", copy, len);
+                    activate_clean_policy_blob(reason ?: "security_read_policy");
+                    return;
+                }
+            } else if (data && len && len <= MAGISK_POLICY_MAX_SIZE) {
+                pr_warn("[selinux_hook] CLEAN security_read_policy snapshot rejected reason=%s len=%zu has_magisk=%d\n",
+                        reason ?: "(null)", len,
+                        buffer_contains_magisk(data, len) ? 1 : 0);
+            }
+        }
         return;
+    }
 
     activate_clean_policy_blob(reason);
 }
@@ -1827,12 +1886,24 @@ static bool finish_deferred_policy_capture(hook_fargs4_t *a, const char *stage,
     if (!a)
         return false;
 
+    /*
+     * 参数布局：小米 4.19 魔改内核裁剪了 selinux_state 符号，但
+     * security_load_policy() 仍是 stateful 签名 (state, data, len, load_state)。
+     * selinux_compat_call_needed() 修正后（4.17-6.4 stateful），
+     * compat 路径直接按 (state, data, len) 取参。非 compat（legacy 内核）
+     * 按 (data, len, load_state) 取参，失败时再试 stateful 布局兜底。
+     */
     if (selinux_compat_call_needed()) {
         data = (void *)a->arg1;
         len = (size_t)a->arg2;
     } else {
         data = (void *)a->arg0;
         len = (size_t)a->arg1;
+        if (!data || !len || len > MAGISK_POLICY_MAX_SIZE) {
+            /* legacy 首选布局失败，尝试 stateful 布局（arg0=state 场景） */
+            data = (void *)a->arg1;
+            len = (size_t)a->arg2;
+        }
     }
 
     if (!data || !len || len > MAGISK_POLICY_MAX_SIZE || !vmalloc_fn) {
@@ -1860,6 +1931,22 @@ static bool finish_deferred_policy_capture(hook_fargs4_t *a, const char *stage,
     }
 
     WRITE_ONCE(g_clean_policy_has_magisk, buffer_contains_magisk(data, len));
+
+    /*
+     * 拒绝含 magisk 字符串的策略：APatch/folkpatch 的 apd 在 post-fs-data
+     * 阶段把规则合入策略后调用 security_load_policy，此时参数已是 dirty
+     * 策略。如果捕获到这种 blob，把它当干净策略只会让后续重定向失效。
+     * boot 早期第一次加载的系统初始策略不含这些 token，若这都含 magisk
+     * 说明厂商 ROM 本身带 magisk 规则，此时放弃捕获更安全。
+     */
+    if (READ_ONCE(g_clean_policy_has_magisk)) {
+        pr_warn("[selinux_hook] CLEAN policy capture rejected stage=%s: blob contains magisk token, keeping live policy\n",
+                stage ?: "security_load_policy");
+        if (vfree_fn)
+            vfree_fn(data);
+        return false;
+    }
+
     WRITE_ONCE(g_clean_policy_len, len);
     WRITE_ONCE(g_clean_policy_blob, data);
     pr_warn("[selinux_hook] CLEAN policy captured from security_load_policy args stage=%s blob=%px len=%zu has_magisk=%d\n",
@@ -1873,8 +1960,13 @@ static void before_security_load_policy(hook_fargs4_t *a, void *u)
     if (READ_ONCE(g_clean_policy_blob) || g_policy_capture_in_progress)
         return;
 
+    /*
+     * before 阶段参数 buffer 仍完整（内核尚未消费），此时抓取最可靠。
+     * 用 allow_fallback=true：文件不存在时直接抓 security_load_policy
+     * 的参数（boot 早期第一次调用加载的是系统初始干净策略）。
+     */
     g_policy_capture_in_progress = true;
-    finish_deferred_policy_capture(a, "before_security_load_policy", false);
+    finish_deferred_policy_capture(a, "before_security_load_policy", true);
     g_policy_capture_in_progress = false;
 }
 
@@ -1885,6 +1977,7 @@ static void after_security_load_policy(hook_fargs4_t *a, void *u)
     if (a && (long)a->ret)
         return;
 
+    /* before 阶段已成功则跳过；否则补抓。 */
     g_policy_capture_in_progress = true;
     finish_deferred_policy_capture(a, "after_security_load_policy", true);
     g_policy_capture_in_progress = false;
